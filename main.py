@@ -17,6 +17,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "data.json")
 
 REQUIRED_ROLE_NAME = "👨‍🎓 | Sheriff Academy"
+BLACKLIST_ROLE_NAME = "blacklist"
 
 # ---------- Stockage (data.json) ----------
 def load():
@@ -29,19 +30,6 @@ def load():
 def save(db):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2, ensure_ascii=False)
-
-STATE_FILE = os.path.join(DATA_DIR, "sync_state.json")
-
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
 
 def default_responses():
     return [
@@ -82,6 +70,7 @@ def default_config():
         "staffRoleId": None,
         "responses": default_responses(),
         "blacklist": {},
+        "pa_channel_id": None, # ID du salon d'annonce PA
     }
 
 def get_guild(guild_id):
@@ -110,7 +99,6 @@ def has_required_role():
         if not interaction.guild:
             return False
         
-        # Vérifie si l'utilisateur possède le rôle spécifique
         has_role = any(role.name == REQUIRED_ROLE_NAME for role in interaction.user.roles)
         if not has_role:
             await interaction.response.send_message(
@@ -540,34 +528,48 @@ async def reponse(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-# ---------- Blacklist : /blacklist, /unblacklist, /blacklist_liste ----------
-BLACKLIST_ROLE_NAME = "blacklist"
-
+# ---------- Système de Blacklist Amélioré ----------
 async def get_blacklist_role(guild, create=True):
     role = discord.utils.find(lambda r: r.name.lower() == BLACKLIST_ROLE_NAME, guild.roles)
     if not role and create:
-        role = await guild.create_role(name=BLACKLIST_ROLE_NAME, reason="Système de blacklist")
+        role = await guild.create_role(
+            name=BLACKLIST_ROLE_NAME,
+            color=discord.Color.dark_gray(),
+            reason="Système de blacklist"
+        )
     return role
 
 async def hide_channels(guild, role):
+    """Bloque toutes les permissions pour le rôle blacklist sur l'intégralité du serveur."""
     count = 0
     for channel in guild.channels:
         overwrite = channel.overwrites_for(role)
-        if overwrite.view_channel is False:
-            continue
         overwrite.view_channel = False
+        overwrite.send_messages = False
+        overwrite.connect = False
         try:
-            await channel.set_permissions(role, overwrite=overwrite, reason="Blacklist : salon masqué")
+            await channel.set_permissions(role, overwrite=overwrite, reason="Blacklist : Accès refusé")
             count += 1
         except discord.HTTPException as e:
-            print(f"❌ Impossible de masquer #{channel.name} : {e}")
+            print(f"❌ Impossible de restreindre #{channel.name} : {e}")
     return count
 
 def clean_id(text):
     digits = re.sub(r"\D", "", text)
     return int(digits) if digits else None
 
-@app_commands.command(name="blacklist", description="Blacklister quelqu'un définitivement (même s'il quitte le serveur)")
+async def apply_blacklist_to_member(guild, member, role):
+    """Retire tous les rôles du membre et lui applique uniquement le rôle blacklist."""
+    try:
+        roles_to_remove = [r for r in member.roles if r != guild.default_role and r != role]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Blacklist : Retrait des permissions")
+        await member.add_roles(role, reason="Ajout rôle Blacklist")
+        return True
+    except discord.Forbidden:
+        return False
+
+@app_commands.command(name="blacklist", description="Blacklister quelqu'un (retire ses rôles et masque les salons)")
 @app_commands.describe(identifiant="ID Discord de la personne", raison="Raison (optionnel)")
 @app_commands.guild_only()
 @has_required_role()
@@ -575,6 +577,7 @@ async def blacklist(interaction: discord.Interaction, identifiant: str, raison: 
     uid = clean_id(identifiant)
     if not uid:
         return await interaction.response.send_message("❌ Identifiant invalide (chiffres uniquement).", ephemeral=True)
+    
     g = get_guild(interaction.guild_id)
     if str(uid) in g["blacklist"]:
         return await interaction.response.send_message("⚠️ Cette personne est déjà blacklistée.", ephemeral=True)
@@ -608,21 +611,15 @@ async def blacklist(interaction: discord.Interaction, identifiant: str, raison: 
         role = None
 
     if role is None:
-        status = (
-            "⚠️ Enregistré, mais je n'ai pas pu préparer le rôle : "
-            "donne-moi « Gérer les rôles » et « Gérer les salons »."
-        )
+        status = "⚠️ Profil enregistré, mais je n'ai pas pu créer/gérer le rôle blacklist (permissions insuffisantes)."
     elif member:
-        try:
-            await member.add_roles(role, reason=f"Blacklist par {interaction.user}")
-            status = f"Le rôle **{role.name}** a été donné à {member.mention} : il ne voit plus aucun salon."
-        except discord.Forbidden:
-            status = (
-                "⚠️ Enregistré, mais je n'ai pas pu donner le rôle : "
-                "mon rôle doit être **au-dessus** du rôle blacklist."
-            )
+        success = await apply_blacklist_to_member(guild, member, role)
+        if success:
+            status = f"✅ Tous les rôles de {member.mention} ont été retirés, le rôle **{role.name}** a été appliqué et tous les salons lui sont masqués."
+        else:
+            status = f"⚠️ Le rôle blacklist a été créé mais je n'ai pas pu modifier les rôles de {member.mention} (mon rôle doit être placé au-dessus du sien dans la liste des rôles)."
     else:
-        status = "La personne n'est pas sur le serveur : le rôle lui sera donné automatiquement si elle revient."
+        status = "La personne n'est pas sur le serveur : ses rôles lui seront retirés et le rôle blacklist lui sera donné automatiquement dès sa connexion."
 
     await interaction.followup.send(
         f"🚫 **{user}** (`{uid}`) est blacklisté(e).\nRaison : {entry['reason']}\n{status}", ephemeral=True
@@ -736,7 +733,19 @@ async def send_recruitment_form(channel, user):
     for emb in embeds:
         await channel.send(embed=emb)
 
-# ---------- Système MP d'Annonce PA (/mp_pa) ----------
+# ---------- Commande de configuration du salon PA (/pa_salon) ----------
+@app_commands.command(name="pa_salon", description="Définir le salon où poster l'annonce de recrutement PA")
+@app_commands.describe(salon="Le salon textuel pour l'annonce PA")
+@app_commands.guild_only()
+@has_required_role()
+async def pa_salon(interaction: discord.Interaction, salon: discord.TextChannel):
+    update_guild(interaction.guild_id, lambda x: x.__setitem__("pa_channel_id", salon.id))
+    await interaction.response.send_message(
+        f"✅ Le salon pour les annonces de recrutement PA est désormais {salon.mention}.",
+        ephemeral=True
+    )
+
+# ---------- Système MP & Salon d'Annonce PA (/mp_pa) ----------
 class TimeSelect(discord.ui.Select):
     def __init__(self):
         times = []
@@ -750,8 +759,9 @@ class TimeSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         selected_time = self.values[0]
+        
         await interaction.followup.send(
-            f"🚀 Envoi des MP en cours pour l'horaire : **{selected_time}**...",
+            f"🚀 Envoi de l'annonce PA en cours (MP + Salon) pour l'horaire : **{selected_time}**...",
             ephemeral=True
         )
 
@@ -775,6 +785,25 @@ class TimeSelect(discord.ui.Select):
         )
 
         guild = interaction.guild
+        g = get_guild(guild.id)
+
+        # 1. Envoi dans le salon PA configuré (si /pa_salon a été configuré)
+        pa_channel_status = "Non configuré"
+        if g.get("pa_channel_id"):
+            channel = guild.get_channel(g["pa_channel_id"])
+            if channel:
+                try:
+                    await channel.send(content="@everyone", allowed_mentions=discord.AllowedMentions(everyone=True))
+                    embed_pa = discord.Embed(
+                        description=message_text,
+                        color=0xC9A227
+                    )
+                    await channel.send(embed=embed_pa)
+                    pa_channel_status = f"Envoyé dans {channel.mention}"
+                except Exception as e:
+                    pa_channel_status = f"Erreur lors de l'envoi dans le salon : {e}"
+
+        # 2. Envoi en MP à tous les membres non-bots
         success = 0
         failed = 0
 
@@ -784,14 +813,16 @@ class TimeSelect(discord.ui.Select):
             try:
                 await member.send(message_text)
                 success += 1
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.4)
             except Exception:
                 failed += 1
 
         await interaction.followup.send(
-            f"✅ **Annonce envoyée !**\n"
+            f"✅ **Annonce PA exécutée avec succès !**\n\n"
+            f"📌 **Salon de l'Annonce :** {pa_channel_status}\n"
+            f"📩 **Messages Privés (MP) :**\n"
             f"• **Envoyés avec succès :** {success}\n"
-            f"• **Bloqués/Échecs (MP fermés) :** {failed}",
+            f"• **Échecs (MP fermés) :** {failed}",
             ephemeral=True
         )
 
@@ -800,12 +831,12 @@ class TimeView(discord.ui.View):
         super().__init__(timeout=180)
         self.add_item(TimeSelect())
 
-@app_commands.command(name="mp_pa", description="Envoyer le message de recrutement PA à tous les membres en MP")
+@app_commands.command(name="mp_pa", description="Poster l'annonce dans le salon PA et l'envoyer en MP à tous les membres")
 @app_commands.guild_only()
 @has_required_role()
 async def mp_pa(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "🕒 **Sélectionnez l'heure de l'événement** dans le menu déroulant ci-dessous :",
+        "🕒 **Sélectionnez l'heure du rendez-vous** dans le menu déroulant ci-dessous :",
         view=TimeView(),
         ephemeral=True
     )
@@ -826,6 +857,7 @@ class MyBot(discord.Client):
         self.tree.add_command(blacklist)
         self.tree.add_command(unblacklist)
         self.tree.add_command(blacklist_liste)
+        self.tree.add_command(pa_salon)
         self.tree.add_command(mp_pa)
 
         self.add_view(CloseView())
@@ -840,7 +872,6 @@ class MyBot(discord.Client):
 
     async def on_ready(self):
         print(f"🤖 Connecté en tant que {self.user} (ID: {self.user.id})")
-        
         try:
             await self.tree.sync()
             print("✅ Commandes slash synchronisées globalement avec succès.")
@@ -851,14 +882,12 @@ class MyBot(discord.Client):
         guild = member.guild
         g = get_guild(guild.id)
 
+        # Re-blacklist automatique à l'arrivée
         if str(member.id) in g["blacklist"]:
             role = await get_blacklist_role(guild, create=False)
             if role:
-                try:
-                    await member.add_roles(role, reason="Retour d'une personne blacklistée")
-                    print(f"🚫 Rôle blacklist réappliqué à {member} ({member.id})")
-                except discord.HTTPException:
-                    pass
+                await apply_blacklist_to_member(guild, member, role)
+                print(f"🚫 Rôle et restrictions de blacklist réappliqués à {member} ({member.id})")
 
 bot = MyBot()
 
